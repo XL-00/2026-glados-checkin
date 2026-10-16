@@ -277,7 +277,7 @@ class GLaDOS:
                     return resp.json()
                 log(f"⚠️ {d} 返回 HTTP {resp.status_code}")
             except (requests.RequestException, ValueError) as e:
-                log(f"⚠️ {d} 请求失败: {e}")
+                log(f"⚠️ {d} 请求失败: {type(e).__name__}")
                 continue
         return None
 
@@ -388,7 +388,7 @@ def pushplus(token, title, content):
         log("✅ PushPlus 推送成功")
         return True
     except (requests.RequestException, ValueError, RuntimeError) as e:
-        log(f"❌ PushPlus 推送失败: {e}")
+        log(f"❌ PushPlus 推送失败: {type(e).__name__}")
         return False
 
 def telegram_push(token, chat_id, title, content):
@@ -435,7 +435,7 @@ def telegram_push(token, chat_id, title, content):
         log("✅ Telegram 推送成功")
         return True
     except (requests.RequestException, ValueError) as e:
-        log(f"❌ Telegram 推送失败: {e}")
+        log(f"❌ Telegram 推送失败: {type(e).__name__}")
         return False
 
 def main():
