@@ -13,12 +13,15 @@
 """
 
 import html
+import hashlib
+import math
 import json
 import os
 import re
 import sys
 import time
 from datetime import datetime
+from urllib.parse import urlsplit
 
 import requests
 
@@ -55,6 +58,9 @@ NORMAL_CHECKIN_MESSAGES = (
     "checkin repeats! please try tomorrow",
     "today's observation logged",
 )
+
+# The current console requires a fresh challenge and a minimum 2.5 second wait.
+CHECKIN_CHALLENGE_DELAY = 2.7
 
 # 积分兑换计划 (#11)：消耗 points 积分兑换 days 天会员。
 # 通过环境变量 EXCHANGE_PLAN 选择，默认 plan500（500 分兑换 100 天），
@@ -187,16 +193,64 @@ def is_non_retryable_checkin_result(result):
     message = str(result.get('message', '')).strip().lower()
     return (
         code == -2
+        or result.get('http_status') in (401, 403)
         or reason == 'device-mismatch'
         or '没有权限' in message
         or 'permission' in message
         or 'unauthorized' in message
+        or 'automated check-in detected' in message
     )
+
+
+def is_missing_api_response(result):
+    return not isinstance(result, dict) or result.get('request_failed') is True
+
+
+def summarize_checkin_failure(result):
+    """Describe failures using fixed labels and allowlisted, non-secret metadata."""
+    if not isinstance(result, dict):
+        return '未收到有效 API 响应；本次请求失败，今日签到状态未知'
+
+    reason = str(result.get('reason', '')).strip().lower()
+    message = str(result.get('message', '')).strip().lower()
+    if reason == 'checkin-challenge-unavailable':
+        label = '未获取有效签到验证，本次未提交签到，请稍后重试'
+    elif reason == 'checkin-challenge-expired':
+        label = '签到验证已过期，本次未提交签到，请稍后重试'
+    elif result.get('request_failed') is True:
+        if result.get('invalid_headers') is True:
+            label = '请求头格式无效，请检查 Cookie 和 User-Agent 格式'
+        elif result.get('invalid_response') is True:
+            label = '服务响应格式异常，未收到有效 API 响应'
+        else:
+            label = '网络或服务暂时异常，未收到有效 API 响应'
+        label += '；本次请求失败，今日签到状态未知'
+    elif reason == 'device-mismatch':
+        label = '服务端拒绝设备校验；请核对会话和 User-Agent 配置'
+    elif 'automated check-in detected' in message:
+        label = '服务端拒绝自动签到；请核对会话配置，仍失败时联系服务方'
+    elif is_non_retryable_checkin_result(result):
+        label = '服务端拒绝会话认证或访问'
+    else:
+        label = '签到失败'
+
+    details = []
+    code = result.get('code')
+    if type(code) is int and -999 <= code <= 999:
+        details.append(f'code={code}')
+    status = result.get('http_status')
+    if type(status) is int and 100 <= status <= 599:
+        details.append(f'http_status={status}')
+    if result.get('request_failed') is True and result.get('timed_out') is True:
+        details.append('timeout=true')
+    if reason in ('device-mismatch', 'http-auth-rejected'):
+        details.append(f'reason={reason}')
+    return label + (f" [{', '.join(details)}]" if details else '')
 
 
 def is_normal_checkin_result(result):
     """Return True for a new check-in or a harmless already-checked-in response."""
-    if not isinstance(result, dict):
+    if is_missing_api_response(result) or is_non_retryable_checkin_result(result):
         return False
 
     message = str(result.get('message', '')).strip().lower()
@@ -219,10 +273,7 @@ def checkin_with_retry(client, attempts=3, delay_seconds=60):
             return last_result, True
 
         if is_non_retryable_checkin_result(last_result):
-            message = last_result.get('message', '认证失败')
-            if last_result.get('reason') == 'device-mismatch':
-                message = '登录设备不匹配，请重新登录并更新完整 Cookie'
-            log(f"❌ 签到认证失败，不再重试: {message}")
+            log(f"❌ 签到认证失败，不再重试: {summarize_checkin_failure(last_result)}")
             return last_result, False
 
         if attempt < attempts:
@@ -251,13 +302,17 @@ class GLaDOS:
                 "2026-09 新版接口可能返回“没有权限”"
             )
 
-    def req(self, method, path, data=None, form=False):
+    def req(self, method, path, data=None, form=False, domains=None):
         """带自动域名切换的请求；form=True 时以表单提交（兑换接口要求）"""
-        for d in DOMAINS:
+        # Validate local configuration before the retry loop or any network request.
+        browser_headers = get_browser_headers()
+        # Keep only fixed, non-secret failure metadata after all domains fail.
+        failure = {'request_failed': True, 'reason': 'request-failed'}
+        for d in DOMAINS if domains is None else domains:
             try:
                 url = f"{d}{path}"
                 h = HEADERS.copy()
-                h.update(get_browser_headers())
+                h.update(browser_headers)
                 h['Cookie'] = self.cookie
                 h['Origin'] = d
                 h['Referer'] = f"{d}/console/checkin"
@@ -273,13 +328,33 @@ class GLaDOS:
                     resp = requests.post(url, headers=h, json=data, timeout=10)
 
                 if resp.status_code == 200:
-                    self.domain = d # Remember working domain
-                    return resp.json()
+                    payload = resp.json()
+                    if isinstance(payload, dict):
+                        self.domain = d # Remember working domain
+                        return payload
+                    failure['invalid_response'] = True
+                    log(f"⚠️ {d} 响应格式异常")
+                    continue
+                if resp.status_code in (401, 403):
+                    # A rejected request must not be replayed on alternate domains.
+                    # The response can be HTML or contain private details; do not echo it.
+                    return {
+                        'http_status': resp.status_code,
+                        'reason': 'http-auth-rejected',
+                    }
+                failure['http_status'] = resp.status_code
                 log(f"⚠️ {d} 返回 HTTP {resp.status_code}")
             except (requests.RequestException, ValueError) as e:
+                # InvalidHeader and other request errors may embed Cookie values.
+                if isinstance(e, requests.Timeout):
+                    failure['timed_out'] = True
+                elif isinstance(e, requests.exceptions.InvalidHeader):
+                    failure['invalid_headers'] = True
+                elif isinstance(e, ValueError):
+                    failure['invalid_response'] = True
                 log(f"⚠️ {d} 请求失败: {type(e).__name__}")
                 continue
-        return None
+        return failure
 
     def get_status(self):
         """获取状态：天数、邮箱"""
@@ -324,7 +399,33 @@ class GLaDOS:
 
     def checkin(self):
         """执行签到"""
-        return self.req('POST', '/api/user/checkin', {'token': 'glados.cloud'})
+        challenge = self.req('GET', '/api/user/checkin/challenge')
+        if is_non_retryable_checkin_result(challenge) or is_missing_api_response(challenge):
+            return challenge
+        nonce = challenge.get('nonce')
+        ttl = challenge.get('ttl', 300000)
+        if (
+            challenge.get('code') != 0
+            or not isinstance(nonce, str) or not 0 < len(nonce) <= 4096
+            or type(ttl) not in (int, float)
+            or (type(ttl) is float and not math.isfinite(ttl))
+            or ttl <= CHECKIN_CHALLENGE_DELAY * 1000
+        ):
+            return {'request_failed': True, 'reason': 'checkin-challenge-unavailable'}
+
+        # A nonce belongs to the origin which issued it. Do not replay the POST
+        # on another domain; the outer retry obtains a fresh challenge instead.
+        domain = self.domain
+        received_at = time.monotonic()
+        proof = hashlib.sha256((nonce + '.glados-observe-v1').encode('utf-8')).hexdigest()
+        time.sleep(CHECKIN_CHALLENGE_DELAY)
+        if (time.monotonic() - received_at) * 1000 >= ttl:
+            return {'request_failed': True, 'reason': 'checkin-challenge-expired'}
+        return self.req('POST', '/api/user/checkin', {
+            'token': urlsplit(domain).hostname,
+            'nonce': nonce,
+            'proof': proof,
+        }, domains=(domain,))
 
     def exchange(self, plan):
         """兑换会员天数：表单提交 planType (plan100/plan200/plan500)"""
@@ -462,7 +563,7 @@ def main():
         attempts = int(os.environ.get("CHECKIN_MAX_ATTEMPTS", "3"))
         delay_seconds = int(os.environ.get("CHECKIN_RETRY_DELAY_SECONDS", "60"))
         res, is_success = checkin_with_retry(g, attempts, delay_seconds)
-        msg = res.get('message', 'Failure') if res else "Network Error"
+        msg = res.get('message', 'Success') if is_success else summarize_checkin_failure(res)
 
         # 2. Get Info (Refresh data)
         g.get_status()
